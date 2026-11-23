@@ -51,6 +51,21 @@ const xAiSessionNotificationMethods = [
 ] as const;
 
 const XAI_TASK_COMPLETED_PROMPT_ID_PREFIX = "task-completed-";
+const XAI_INTERJECT_FALLBACK_PROMPT_ID_PREFIX = "interject-fallback-";
+
+// An interjection can start its own native reply after the original prompt has settled.
+function isXAiInterjectFallbackPromptId(promptId: unknown): promptId is string {
+  return (
+    typeof promptId === "string" && promptId.startsWith(XAI_INTERJECT_FALLBACK_PROMPT_ID_PREFIX)
+  );
+}
+
+export function xAiPostPromptReplyId(
+  notification: EffectAcpSchema.SessionNotification,
+): string | undefined {
+  const promptId = notification._meta?.promptId;
+  return isXAiInterjectFallbackPromptId(promptId) ? promptId : undefined;
+}
 
 export function xAiPromptCompleteFromSessionUpdate(
   notification: XAiSessionUpdateNotification,
@@ -400,6 +415,7 @@ const XAiTaskLifecycleNotification = Schema.Struct({
 });
 
 type XAiTaskLifecycleNotification = typeof XAiTaskLifecycleNotification.Type;
+const decodeXAiTaskLifecycleNotification = Schema.decodeUnknownEffect(XAiTaskLifecycleNotification);
 
 export interface XAiBackgroundTaskLifecycleMutation {
   readonly sessionId: string;
@@ -478,6 +494,37 @@ export const registerXAiBackgroundTaskTracking = (
         return mutation === null ? Effect.void : apply(mutation);
       }),
     { discard: true },
+  ).pipe(
+    Effect.andThen(
+      Effect.forEach(
+        xAiSessionNotificationMethods,
+        (method) =>
+          runtime.handleExtNotification(method, Schema.Unknown, (params) => {
+            const update = unknownRecord(unknownRecord(params)?.update)?.sessionUpdate;
+            if (update !== "task_backgrounded" && update !== "task_completed") return Effect.void;
+            return decodeXAiTaskLifecycleNotification(params).pipe(
+              Effect.flatMap((notification) => {
+                const mutation = xAiBackgroundTaskLifecycleMutation(
+                  notification,
+                  update === "task_completed" ? "completed" : "running",
+                );
+                return mutation === null ? Effect.void : apply(mutation);
+              }),
+              Effect.catchTags({
+                SchemaError: (error) =>
+                  Effect.fail(
+                    EffectAcpErrors.AcpProtocolParseError.fromSchemaError(
+                      "decode-notification-payload",
+                      method,
+                      error,
+                    ),
+                  ),
+              }),
+            );
+          }),
+        { discard: true },
+      ),
+    ),
   );
 
 /** Sent on the parent session; will_wake means a subagent-completed-<id> turn follows. */
@@ -505,14 +552,22 @@ export function xAiSubagentFinishedNotice(
   };
 }
 
-export const registerXAiSubagentFinished = (
+export const registerXAiSessionUpdates = (
   runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "handleExtNotification">,
   finish: (notice: XAiSubagentFinishedNotice) => Effect.Effect<void>,
+  finishReply: (notice: {
+    readonly sessionId: string;
+    readonly replyId: string;
+  }) => Effect.Effect<void>,
 ): Effect.Effect<void> =>
   Effect.forEach(
     xAiSessionNotificationMethods,
     (method) =>
       runtime.handleExtNotification(method, XAiSessionUpdateNotification, (notification) => {
+        const completion = xAiPromptCompleteFromSessionUpdate(notification);
+        if (completion !== null && isXAiInterjectFallbackPromptId(completion.promptId)) {
+          return finishReply({ sessionId: completion.sessionId, replyId: completion.promptId });
+        }
         const notice = xAiSubagentFinishedNotice(notification);
         return notice === null ? Effect.void : finish(notice);
       }),
@@ -1477,7 +1532,7 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
     // Grok multiplexes session updates on extension methods that permit only one handler.
     const sessionNotificationHandlers = new Map<
       string,
-      (params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>
+      Array<(params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>>
     >();
     let nextPromptFallbackId = 0;
     const allocatePromptFallbackId = Effect.sync(() => {
@@ -1518,8 +1573,12 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
             }),
             Effect.ignore,
             Effect.andThen(
-              Effect.suspend(
-                () => sessionNotificationHandlers.get(method)?.(params) ?? Effect.void,
+              Effect.suspend(() =>
+                Effect.forEach(
+                  sessionNotificationHandlers.get(method) ?? [],
+                  (handler) => handler(params),
+                  { discard: true },
+                ),
               ),
             ),
           ),
@@ -1532,7 +1591,8 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
       handleExtNotification: (method, payload, handler) =>
         xAiSessionNotificationMethods.some((owned) => owned === method)
           ? Effect.sync(() => {
-              sessionNotificationHandlers.set(method, (params) =>
+              const handlers = sessionNotificationHandlers.get(method) ?? [];
+              handlers.push((params) =>
                 Schema.decodeUnknownEffect(payload)(params).pipe(
                   Effect.mapError((error) =>
                     EffectAcpErrors.AcpProtocolParseError.fromSchemaError(
@@ -1544,6 +1604,7 @@ export const makeXAiPromptCompletionRuntime = Effect.fn("makeXAiPromptCompletion
                   Effect.flatMap(handler),
                 ),
               );
+              sessionNotificationHandlers.set(method, handlers);
             })
           : runtime.handleExtNotification(method, payload, handler),
       prompt: Effect.fn("xaiAcpExtension.prompt")(function* (payload, promptOptions?) {

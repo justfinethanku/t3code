@@ -11754,6 +11754,205 @@ describe("AcpAdapterV2", () => {
       }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect.each(["early monitor exit", "post-prompt interjection"] as const)(
+    "settles a Grok turn once after %s on the native session update channel",
+    (scenario) =>
+      Effect.gen(function* () {
+        type Runtime = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdate: Parameters<Runtime["handleSessionUpdate"]>[0] | undefined;
+        let nativeUpdate:
+          | ((params: unknown) => Effect.Effect<void, EffectAcpErrors.AcpError>)
+          | undefined;
+        const promptStarted = yield* Deferred.make<void>();
+        const promptSettled = yield* Deferred.make<void>();
+        const finalizeScheduled = yield* Deferred.make<Duration.Input>();
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const mockAgentPath = yield* bundledMockAgentPath;
+        const instanceId = ProviderInstanceId.make("grok-monitor-replay");
+        const adapter = yield* makeGrokAdapterV2({
+          instanceId,
+          settings: DEFAULT_GROK_SETTINGS,
+          environment: {},
+          hostPlatform: yield* HostProcess.Platform,
+          selfInvocation: yield* resolveSelfInvocation(),
+          testHooks: {
+            afterPromptCallback: () =>
+              Deferred.succeed(promptSettled, undefined).pipe(Effect.asVoid),
+            onDeferredFinalizeScheduled: (delay) =>
+              Deferred.succeed(finalizeScheduled, delay).pipe(Effect.asVoid),
+          },
+          makeRuntime: (input) =>
+            makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdate = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                handleExtNotification: (method, schema, handler) =>
+                  Effect.sync(() => {
+                    if (method === "_x.ai/session/update") {
+                      nativeUpdate = (params) => handler(Schema.decodeUnknownSync(schema)(params));
+                    }
+                  }),
+                prompt: () =>
+                  Deferred.succeed(promptStarted, undefined).pipe(Effect.andThen(Effect.never)),
+              }),
+            })(input).pipe(Effect.flatMap(makeXAiPromptCompletionRuntime)),
+        });
+        const threadId = ThreadId.make("grok-monitor-replay");
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("grok-monitor-replay"),
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* runtime.events.pipe(
+          Stream.runForEach((event) => Queue.offer(events, event)),
+          Effect.forkScoped,
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* runtime
+          .startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy,
+              now: yield* DateTime.now,
+            }),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(promptStarted);
+        assert.isDefined(sessionUpdate);
+        assert.isDefined(nativeUpdate);
+        const sessionId = "mock-session-1";
+        const taskId = "00000000-0000-4000-8000-000000000001";
+        const toolCallId = "call-monitor";
+        const update = (update: EffectAcpSchema.SessionUpdate, promptId?: string) =>
+          sessionUpdate!({
+            sessionId,
+            update,
+            ...(promptId === undefined ? {} : { _meta: { promptId } }),
+          });
+        const native = (update: Record<string, unknown>, targetSessionId = sessionId) =>
+          nativeUpdate!({ sessionId: targetSessionId, update });
+        const completePrompt = (promptId: string, targetSessionId = sessionId) =>
+          native(
+            { sessionUpdate: "turn_completed", prompt_id: promptId, stop_reason: "end_turn" },
+            targetSessionId,
+          );
+        const completeMonitor = () =>
+          native({
+            sessionUpdate: "task_completed",
+            task_snapshot: {
+              task_id: taskId,
+              kind: "monitor",
+              exit_code: 127,
+              output: "Command unavailable.\n",
+            },
+            will_wake: true,
+          });
+        const say = (text: string, promptId: string) =>
+          update(
+            { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+            promptId,
+          );
+
+        // Sanitized VSW-247 monitor frames and HK-183 prompt identities.
+        yield* update({
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: "Monitor",
+          status: "pending",
+        });
+        yield* update({
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          kind: "other",
+          rawInput: { variant: "Monitor", command: "example-command", persistent: false },
+        });
+        yield* native({
+          sessionUpdate: "task_backgrounded",
+          task_id: taskId,
+          tool_call_id: toolCallId,
+          command: "example-command",
+          monitor_description: "Monitor example",
+        });
+        yield* update({
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          status: "completed",
+          rawOutput: { type: "Monitor", taskId, persistent: false },
+        });
+        if (scenario === "early monitor exit") yield* completeMonitor();
+        yield* say("Initial report.", "t3-xai-prompt-1");
+        yield* completePrompt("t3-xai-prompt-1");
+        yield* Deferred.await(promptSettled);
+
+        const replyId = "interject-fallback-00000000-0000-4000-8000-000000000002";
+        if (scenario === "post-prompt interjection") {
+          assert.isFalse(
+            yield* Deferred.isDone(finalizeScheduled),
+            "a live monitor still holds the run",
+          );
+          yield* say("Review changes are ready.", replyId);
+          yield* completeMonitor();
+          yield* completePrompt(replyId, "another-session");
+          yield* completePrompt("interject-fallback-old");
+          yield* completePrompt(`task-completed-${taskId}`);
+          assert.isFalse(
+            yield* Deferred.isDone(finalizeScheduled),
+            "only the matching reply can release its hold",
+          );
+          yield* completePrompt(replyId);
+        }
+        yield* completeMonitor();
+        yield* update({
+          sessionUpdate: "user_message_chunk",
+          content: { type: "text", text: `Monitor "${taskId}" ended: [monitor ended: exit 127]` },
+        });
+        yield* say("Monitor wake report.", `task-completed-${taskId}`);
+        yield* completePrompt(`task-completed-${taskId}`);
+        if (yield* Deferred.isDone(finalizeScheduled)) {
+          yield* TestClock.adjust(yield* Deferred.await(finalizeScheduled));
+        }
+        yield* completePrompt(replyId);
+        yield* TestClock.adjust("3 seconds");
+        const allEvents = yield* Queue.takeAll(events);
+        const monitor = allEvents.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === toolCallId,
+        );
+        assert.equal(monitor?.type === "turn_item.updated" && monitor.turnItem.status, "failed");
+        assert.deepEqual(
+          allEvents.filter((event) => event.type === "turn.terminal").map((event) => event.status),
+          ["completed"],
+        );
+        const report = allEvents.findLast(
+          (event) =>
+            event.type === "message.updated" &&
+            event.message.text ===
+              (scenario === "early monitor exit" ? "Initial report." : "Review changes are ready."),
+        );
+        assert.equal(report?.type === "message.updated" && report.message.streaming, false);
+      }).pipe(Effect.provide(layerTest)),
+  );
+
   // A dev server started as a background shell never exits, so it must not hold the root turn.
   const startGrokBackgroundShellTurn = Effect.fnUntraced(function* (name: string) {
     const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
