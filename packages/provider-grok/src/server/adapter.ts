@@ -49,7 +49,8 @@ import {
   xAiBackgroundShellTaskId,
   isXAiPersistentMonitor,
   extractXAiExitPlanMarkdown,
-  registerXAiSubagentFinished,
+  registerXAiSessionUpdates,
+  xAiPostPromptReplyId,
   makeXAiAskUserQuestionCancelledResponse,
   makeXAiAskUserQuestionResponse,
   makeXAiExitPlanModeCapturedResponse,
@@ -181,11 +182,12 @@ const registerGrokAcpExtensions: NonNullable<AcpAdapterV2Flavor["registerExtensi
   requestUserInput,
   applyBackgroundTaskMutation,
   finishSubagent,
+  finishPostPromptReply,
   captureProposedPlan,
   lastProposedPlanMarkdown,
 }) =>
   registerXAiBackgroundTaskTracking(runtime, applyBackgroundTaskMutation).pipe(
-    Effect.andThen(registerXAiSubagentFinished(runtime, finishSubagent)),
+    Effect.andThen(registerXAiSessionUpdates(runtime, finishSubagent, finishPostPromptReply)),
     Effect.andThen(registerGrokAskUserQuestionExtensions({ runtime, requestUserInput })),
     Effect.andThen(
       registerGrokExitPlanModeExtensions({
@@ -447,6 +449,7 @@ export function makeGrokAcpAdapterFlavor(
     ],
     isPersistentBackgroundTool: isXAiPersistentMonitor,
     isProviderWakeNotification: isXAiTaskCompletedWakeNotification,
+    postPromptReplyId: xAiPostPromptReplyId,
     deferFinalizeForBackgroundWork: true,
     enablePostSettleContinuation: true,
     ...(options.assertComplete === undefined ? {} : { assertComplete: options.assertComplete }),
