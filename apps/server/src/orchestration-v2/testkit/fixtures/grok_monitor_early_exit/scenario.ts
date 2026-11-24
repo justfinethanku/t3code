@@ -47,8 +47,16 @@ export function assertGrokMonitorEarlyExitOutput(
       event.payload.id === monitor?.id &&
       event.payload.status === "failed",
   );
-  const terminalRuns = result.domainEvents.flatMap((event, index) =>
-    event.type === "run.updated" && event.payload.status === "completed"
+  // A run can report `completed` again after its turn-end checkpoint; order by the first report.
+  const terminalRuns = result.domainEvents.flatMap((event, index, events) =>
+    event.type === "run.updated" &&
+    event.payload.status === "completed" &&
+    events.findIndex(
+      (earlier) =>
+        earlier.type === "run.updated" &&
+        earlier.payload.id === event.payload.id &&
+        earlier.payload.status === "completed",
+    ) === index
       ? [{ id: event.payload.id, index }]
       : [],
   );
